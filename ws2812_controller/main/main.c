@@ -28,7 +28,7 @@ static const char *TAG = "example";
 // Dynamic number of LEDs (adjust this value as needed)
 static uint32_t EXAMPLE_LED_NUMBERS = 8; // You can dynamically change this value
 float g_led_brightness = 0.2f; // Range: 0.0 (off) to 1.0 (full brightness)
-int EXAMPLE_CHASE_SPEED_MS = 50;
+int EXAMPLE_CHASE_SPEED_MS = 70;
 
 static EventGroupHandle_t wifi_event_group;
 // Array to store LED color values (RGB for each LED)
