@@ -1,5 +1,7 @@
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "esp_private/panic_internal.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -15,6 +17,8 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "mdns.h"
+#include <inttypes.h>
+
 
 #define RMT_LED_STRIP_RESOLUTION_HZ 10000000 // 10MHz resolution, 1 tick = 0.1us (led strip needs a high resolution)
 #define RMT_LED_STRIP_GPIO_NUM      18
@@ -29,14 +33,37 @@
 #define BUFFER_SIZE 1024
 
 static const char *TAG = "example";
+const char *device_type = "RGB_CON";
 
  uint8_t mac[6];
  char device_id[5];      // Full MAC as string "A1B2C3D4E5F6"
-const char *device_type = "RGB_CON";  // Fixed device type
-// Dynamic number of LEDs (adjust this value as needed)
-static uint32_t EXAMPLE_LED_NUMBERS = 8; // You can dynamically change this value
-float g_led_brightness = 1.0f; // Range: 0.0 (off) to 1.0 (full brightness)
-int EXAMPLE_CHASE_SPEED_MS = 70;
+
+typedef struct {
+    rmt_channel_handle_t led_chan;
+    rmt_encoder_handle_t led_encoder;
+} led_task_params_t;
+
+
+
+typedef struct {
+    uint32_t led_numbers;       // Number of LEDs, can be updated dynamically
+    float led_brightness;       // Brightness of LEDs
+    int chase_speed_ms;
+    int chase_direction;
+    int mode;
+    uint32_t colour;         // Speed of chase effect
+} led_config_t;
+
+// Initialize with default values
+led_config_t g_led_config = {
+    .led_numbers = 8,           // Default number of LEDs
+    .led_brightness = 1.0f,     // Default brightness (full brightness)
+    .chase_speed_ms = 70 ,
+    .chase_direction = 1 ,
+    .mode = 1,
+    .colour = 0xffffff     
+};
+
 
 static EventGroupHandle_t wifi_event_group;
 // Array to store LED color values (RGB for each LED)
@@ -45,73 +72,225 @@ typedef struct {
     char ssid[32];
     char password[64];
 } wifi_creds_t;
+// Function to parse the TCP message and update the global buffer
 
-void tcp_receive_task(void *pvParameters) {
-    char rx_buffer[BUFFER_SIZE];
-    int addr_family = AF_INET;
-    int ip_protocol = IPPROTO_IP;
+void update_led_buffer(uint32_t new_led_numbers) {
+    // Check if the number of LEDs has changed
+    if (new_led_numbers != g_led_config.led_numbers) {
+        // Reallocate memory for the LED buffer based on the new number of LEDs
+        led_strip_pixels = (uint8_t *)realloc(led_strip_pixels, new_led_numbers * 3 * sizeof(uint8_t));
+        if (led_strip_pixels == NULL) {
+            ESP_LOGE(TAG, "Failed to reallocate memory for LED pixels");
+            return;
+        }
+        // Update the global led_numbers to the new value
+        //led_numbers = new_led_numbers;
+        //ESP_LOGI(TAG, "LED buffer resized to accommodate %u LEDs", led_numbers);
+    }
+}
 
-    struct sockaddr_in server_addr;
-    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+esp_err_t save_led_config_to_nvs() {
+    nvs_handle_t my_handle;
+    esp_err_t err = nvs_open("led_config", NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err |= nvs_set_u32(my_handle, "led_numbers", g_led_config.led_numbers);
+    err |= nvs_set_blob(my_handle, "led_brightness", &g_led_config.led_brightness, sizeof(g_led_config.led_brightness));
+    err |= nvs_set_i32(my_handle, "chase_speed_ms", g_led_config.chase_speed_ms);
+    err |= nvs_set_i32(my_handle, "direction", g_led_config.chase_direction);
+    err |= nvs_set_i32(my_handle, "mode", g_led_config.mode);
+    err |= nvs_set_u32(my_handle, "colour", g_led_config.colour);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error writing LED config to NVS: %s", esp_err_to_name(err));
+        nvs_close(my_handle);
+        return err;
+    }
+
+    err = nvs_commit(my_handle);
+    nvs_close(my_handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to commit LED config: %s", esp_err_to_name(err));
+    }
+
+    return err;
+}
+
+
+esp_err_t load_led_config_from_nvs() {
+    nvs_handle_t my_handle;
+    esp_err_t err = nvs_open("led_config", NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Load led_numbers
+    err = nvs_get_u32(my_handle, "led_numbers", &g_led_config.led_numbers);
+    if (err != ESP_OK || g_led_config.led_numbers == 0) {
+        ESP_LOGW(TAG, "Invalid or missing led_numbers, using default 30");
+        g_led_config.led_numbers = 30;
+        nvs_set_u32(my_handle, "led_numbers", g_led_config.led_numbers);
+    }
+
+    // Load led_brightness
+    size_t size = sizeof(g_led_config.led_brightness);
+    err = nvs_get_blob(my_handle, "led_brightness", &g_led_config.led_brightness, &size);
+    if (err != ESP_OK) {
+        g_led_config.led_brightness = 1.0f;
+        nvs_set_blob(my_handle, "led_brightness", &g_led_config.led_brightness, size);
+    }
+
+    // Load integers with proper APIs
+    err = nvs_get_i32(my_handle, "chase_speed_ms", &g_led_config.chase_speed_ms);
+    if (err != ESP_OK) {
+        g_led_config.chase_speed_ms = 500;
+        nvs_set_i32(my_handle, "chase_speed_ms", g_led_config.chase_speed_ms);
+    }
+
+    err = nvs_get_i32(my_handle, "direction", &g_led_config.chase_direction);
+    if (err != ESP_OK) {
+        g_led_config.chase_direction = 0;
+        nvs_set_i32(my_handle, "direction", g_led_config.chase_direction);
+    }
+
+    err = nvs_get_i32(my_handle, "mode", &g_led_config.mode);
+    if (err != ESP_OK) {
+        g_led_config.mode = 1;
+        nvs_set_i32(my_handle, "mode", g_led_config.mode);
+    }
+
+    err = nvs_get_u32(my_handle, "colour", &g_led_config.colour);
+    if (err != ESP_OK) {
+        g_led_config.colour = 0xFFFFFF;
+        nvs_set_u32(my_handle, "colour", g_led_config.colour);
+    }
+
+    err = nvs_commit(my_handle);
+    nvs_close(my_handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to commit changes: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Print loaded config
+    printf("Updated buffer: LED Numbers: %lu, LED Brightness: %.2f, Speed: %d ms\n", 
+           g_led_config.led_numbers, g_led_config.led_brightness, g_led_config.chase_speed_ms);
+    printf("Direction: %d, Mode: %d, Colour: 0x%08lx\n",
+           g_led_config.chase_direction,
+           g_led_config.mode,
+           (unsigned long)g_led_config.colour);
+
+    return ESP_OK;
+}
+
+
+
+void update_led_config_from_message(const char* message) {
+    uint32_t led_numbers;
+    float led_brightness;
+    int chase_speed_ms;
+    int direction1;
+    int mode1;
+    uint32_t colour1;
+
+    // Parse the message
+    int parsed_items = sscanf(message, 
+                               "led_numbers=%lu,led_brightness=%f,chase_speed_ms=%d,direction=%u,mode=%u,colour=%08lx", 
+                               &led_numbers, &led_brightness, &chase_speed_ms,&direction1,&mode1,&colour1);
+
+    if (parsed_items == 6) {
+        // Update the values
+        g_led_config.led_numbers = led_numbers;
+        update_led_buffer(led_numbers);
+        g_led_config.led_brightness = led_brightness;
+        g_led_config.chase_speed_ms = chase_speed_ms;
+        g_led_config.chase_direction = direction1;
+        g_led_config.mode = mode1;
+        g_led_config.colour = colour1;
+
+        // Save to NVS
+        save_led_config_to_nvs();
+
+        // Log the updated values
+        ESP_LOGI(TAG, "Updated LED settings: led_numbers=%lu, led_brightness=%f, chase_speed_ms=%d",
+                 led_numbers, led_brightness, chase_speed_ms);
+        printf("Updated buffer: LED Numbers: %lu, LED Brightness: %.2f, Speed: %d ms\n ", 
+               g_led_config.led_numbers, g_led_config.led_brightness, g_led_config.chase_speed_ms);
+        printf("direction: %u, mode: %u, colour: 0x%08lx\n",
+               g_led_config.chase_direction,
+               g_led_config.mode,
+               (unsigned long)g_led_config.colour);
+    } else {
+        printf("Failed to parse message properly\n");
+    }
+}
+
+// TCP server task
+void tcp_server_task1(void *pvParameters) {
+    struct sockaddr_in server_addr, client_addr;
+    int sockfd, new_sock;
+    socklen_t addr_len = sizeof(client_addr);
+    char recv_buffer[1024];
+
+    // Create socket
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        printf("Unable to create socket\n");
+        return;
+    }
+
+    // Set up server address
+    memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORTt);
 
-    int listen_sock = socket(addr_family, SOCK_STREAM, ip_protocol);
-    if (listen_sock < 0) {
-        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-        vTaskDelete(NULL);
+    // Bind socket
+    if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        printf("Bind failed\n");
+        close(sockfd);
+        return;
     }
-    ESP_LOGI(TAG, "Socket created");
 
-    int err = bind(listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
-    if (err != 0) {
-        ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
-        close(listen_sock);
-        vTaskDelete(NULL);
-    }
-    ESP_LOGI(TAG, "Socket bound, port %d", PORTt);
-
-    err = listen(listen_sock, 1);
-    if (err != 0) {
-        ESP_LOGE(TAG, "Error occurred during listen: errno %d", errno);
-        close(listen_sock);
-        vTaskDelete(NULL);
-    }
+    // Listen for incoming connections
+    listen(sockfd, 5);
+    printf("Server listening on port %d\n", PORT);
 
     while (1) {
-        ESP_LOGI(TAG, "Waiting for connection...");
-        struct sockaddr_in client_addr;
-        uint addr_len = sizeof(client_addr);
-        int client_sock = accept(listen_sock, (struct sockaddr *)&client_addr, &addr_len);
-        if (client_sock < 0) {
-            ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
+        // Accept a client connection
+        new_sock = accept(sockfd, (struct sockaddr *)&client_addr, &addr_len);
+        if (new_sock < 0) {
+            printf("Connection failed\n");
             continue;
         }
-        ESP_LOGI(TAG, "Socket accepted");
 
-        while (1) {
-            int len = recv(client_sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
-            if (len < 0) {
-                ESP_LOGE(TAG, "recv failed: errno %d", errno);
-                break;
-            } else if (len == 0) {
-                ESP_LOGI(TAG, "Connection closed");
-                break;
-            } else {
-                rx_buffer[len] = 0;  // Null-terminate
-                ESP_LOGI(TAG, "Received %d bytes: %s", len, rx_buffer);
+        printf("Client connected\n");
 
-                // You can store this to a global buffer or process here
-            }
+        // Receive the message from the client
+        int recv_len = recv(new_sock, recv_buffer, sizeof(recv_buffer), 0);
+        if (recv_len > 0) {
+            recv_buffer[recv_len] = '\0';  // Null-terminate the received string
+            printf("Received message: %s\n", recv_buffer);
+            // Update the global buffer with the received data
+            update_led_config_from_message(recv_buffer);
+        } else {
+            printf("Failed to receive data\n");
         }
 
-        close(client_sock);
-        ESP_LOGI(TAG, "Client socket closed");
+        // Close the connection
+        close(new_sock);
     }
 
-    close(listen_sock);
-    vTaskDelete(NULL);
+    // Close server socket
+    close(sockfd);
 }
+
 
 
 esp_err_t mdns_init_example(uint8_t *mac)
@@ -308,7 +487,7 @@ void init_device_info() {
 void apply_global_brightness(uint8_t *pixels, size_t num_leds)
 {
     for (size_t i = 0; i < num_leds * 3; i++) {
-        pixels[i] = (uint8_t)(pixels[i] * g_led_brightness);
+        pixels[i] = (uint8_t)(pixels[i] * g_led_config.led_brightness);
     }
 }
 
@@ -542,72 +721,101 @@ void rainbow_chase(rmt_channel_handle_t led_chan, rmt_encoder_handle_t led_encod
         .loop_count = 0, // no transfer loop
     };
 
-    while (1) {
+    while (g_led_config.mode == 2) {
         for (int i = 0; i < 3; i++) {
-            for (int j = i; j < EXAMPLE_LED_NUMBERS; j += 3) {
-                // Build RGB pixels
-                hue = j * 360 / EXAMPLE_LED_NUMBERS + start_rgb;
-                led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
-                led_strip_pixels[j * 3 + 0] = green;
-                led_strip_pixels[j * 3 + 1] = blue;
-                led_strip_pixels[j * 3 + 2] = red;
+            if (g_led_config.chase_direction == 1) { // Forward
+                for (int j = i; j < g_led_config.led_numbers; j += 3) {
+                    hue = j * 360 / g_led_config.led_numbers + start_rgb;
+                    led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
+                    led_strip_pixels[j * 3 + 0] = green;
+                    led_strip_pixels[j * 3 + 1] = blue;
+                    led_strip_pixels[j * 3 + 2] = red;
+                }
+            } else { // Reverse
+                for (int j = g_led_config.led_numbers - 1 - i; j >= 0; j -= 3) {
+                    hue = j * 360 / g_led_config.led_numbers + start_rgb;
+                    led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
+                    led_strip_pixels[j * 3 + 0] = green;
+                    led_strip_pixels[j * 3 + 1] = blue;
+                    led_strip_pixels[j * 3 + 2] = red;
+                }
             }
 
-            // Apply global brightness before sending the data
-            apply_global_brightness(led_strip_pixels, EXAMPLE_LED_NUMBERS);
-
-            // Flush RGB values to LEDs
-            ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, EXAMPLE_LED_NUMBERS * 3, &tx_config));
+            apply_global_brightness(led_strip_pixels, g_led_config.led_numbers);
+            ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, g_led_config.led_numbers * 3, &tx_config));
             ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
-            vTaskDelay(pdMS_TO_TICKS(EXAMPLE_CHASE_SPEED_MS));
+            vTaskDelay(pdMS_TO_TICKS(g_led_config.chase_speed_ms));
 
-            // Clear LEDs
-            memset(led_strip_pixels, 0, EXAMPLE_LED_NUMBERS * 3);
-            ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, EXAMPLE_LED_NUMBERS * 3, &tx_config));
+            memset(led_strip_pixels, 0, g_led_config.led_numbers * 3);
+            ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, g_led_config.led_numbers * 3, &tx_config));
             ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
-            vTaskDelay(pdMS_TO_TICKS(EXAMPLE_CHASE_SPEED_MS));
+            vTaskDelay(pdMS_TO_TICKS(g_led_config.chase_speed_ms));
         }
         start_rgb += 60;
     }
 }
 
+void theater_chase_effect(rmt_channel_handle_t led_chan, rmt_encoder_handle_t led_encoder, uint32_t hex_color) {
+    ESP_LOGI(TAG, "Starting theater chase effect");
 
-void color_wipe_chase(rmt_channel_handle_t led_chan, rmt_encoder_handle_t led_encoder, uint32_t color_r, uint32_t color_g, uint32_t color_b)
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,  // No hardware loop
+    };
+
+    uint8_t red = (hex_color >> 16) & 0xFF;  // Extract Red
+    uint8_t green = (hex_color >> 8) & 0xFF; // Extract Green
+    uint8_t blue = hex_color & 0xFF;         // Extract Blue
+
+    int wait_ms = 50;  // Adjust the chase speed here
+
+    while (g_led_config.mode == 4) {
+        // Create a chase effect by turning on and off each LED
+        for (int j = 0; j < 3; j++) {  // Chase colors (Red, Green, Blue)
+            for (int i = 0; i < g_led_config.led_numbers; i++) {
+                // Clear the strip
+                memset(led_strip_pixels, 0, g_led_config.led_numbers * 3);
+                
+                // Turn on every third LED in sequence
+                if (i % 3 == j) {
+                    led_strip_pixels[i * 3 + 0] = green;  // Green
+                    led_strip_pixels[i * 3 + 1] = red;    // Red
+                    led_strip_pixels[i * 3 + 2] = blue;   // Blue
+                }
+
+                ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, g_led_config.led_numbers * 3, &tx_config));
+                ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));  // Wait for transmit to finish
+            }
+            vTaskDelay(pdMS_TO_TICKS(wait_ms));  // Adjust chase speed
+        }
+    }
+}
+
+
+
+void color_wipe_chase(rmt_channel_handle_t led_chan, rmt_encoder_handle_t led_encoder)
 {
     rmt_transmit_config_t tx_config = {
         .loop_count = 0,
     };
+     
 
-    while (1) {
-        for (int i = 0; i < EXAMPLE_LED_NUMBERS; i++) {
-            memset(led_strip_pixels, 0, EXAMPLE_LED_NUMBERS * 3);
-            led_strip_pixels[i * 3 + 0] = color_g;
-            led_strip_pixels[i * 3 + 1] = color_b;
-            led_strip_pixels[i * 3 + 2] = color_r;
-            ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, EXAMPLE_LED_NUMBERS * 3, &tx_config));
+    while (g_led_config.mode == 3) {
+	uint8_t red = (g_led_config.colour >> 16) & 0xFF;  // Extract Red
+    uint8_t green = (g_led_config.colour >> 8) & 0xFF; // Extract Green
+    uint8_t blue = g_led_config.colour & 0xFF;
+        for (int i = 0; i < g_led_config.led_numbers; i++) {
+            memset(led_strip_pixels, 0, g_led_config.led_numbers * 3);
+            led_strip_pixels[i * 3 + 0] = green;
+            led_strip_pixels[i * 3 + 1] = blue;
+            led_strip_pixels[i * 3 + 2] = red;
+            ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, g_led_config.led_numbers * 3, &tx_config));
             ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
             vTaskDelay(pdMS_TO_TICKS(50)); // adjust speed here
         }
     }
 }
 
-void set_all_leds_color(rmt_channel_handle_t led_chan, rmt_encoder_handle_t led_encoder, uint8_t red, uint8_t green, uint8_t blue)
-{
-    rmt_transmit_config_t tx_config = {
-        .loop_count = 0,
-    };
 
-    // Set color for all LEDs
-    for (int i = 0; i < EXAMPLE_LED_NUMBERS; i++) {
-        led_strip_pixels[i * 3 + 0] = green; // GBR format
-        led_strip_pixels[i * 3 + 1] = blue;
-        led_strip_pixels[i * 3 + 2] = red;
-    }
-
-    // Now transmit
-    ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, EXAMPLE_LED_NUMBERS * 3, &tx_config));
-    ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
-}
 
 void set_all_leds_color_from_hex(rmt_channel_handle_t led_chan, rmt_encoder_handle_t led_encoder, uint32_t hex_color)
 {
@@ -621,48 +829,182 @@ void set_all_leds_color_from_hex(rmt_channel_handle_t led_chan, rmt_encoder_hand
     uint8_t blue = hex_color & 0xFF;         // Extract Blue
 
     // Set color for all LEDs
-    for (int i = 0; i < EXAMPLE_LED_NUMBERS; i++) {
+    for (int i = 0; i < g_led_config.led_numbers; i++) {
         led_strip_pixels[i * 3 + 0] = green; // GBR format
         led_strip_pixels[i * 3 + 1] = blue;
         led_strip_pixels[i * 3 + 2] = red;
     }
 
     // Transmit the color data
-    ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, EXAMPLE_LED_NUMBERS * 3, &tx_config));
+    ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels,g_led_config.led_numbers * 3, &tx_config));
     ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
 }
 
+
+void running_lights_effect(rmt_channel_handle_t led_chan, rmt_encoder_handle_t led_encoder, uint32_t hex_color) {
+    ESP_LOGI(TAG, "Starting running lights effect");
+
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,  // No hardware loop
+    };
+
+    uint8_t red = (hex_color >> 16) & 0xFF;  // Extract Red
+    uint8_t green = (hex_color >> 8) & 0xFF; // Extract Green
+    uint8_t blue = hex_color & 0xFF;         // Extract Blue
+
+    int wait_ms = 100;  // Adjust speed of running lights
+
+    while (g_led_config.mode == 5) {
+        for (int i = 0; i < g_led_config.led_numbers; i++) {
+            // Clear the strip
+            memset(led_strip_pixels, 0, g_led_config.led_numbers * 3);
+            
+            // Turn on a single LED
+            led_strip_pixels[i * 3 + 0] = green;  // Green
+            led_strip_pixels[i * 3 + 1] = red;    // Red
+            led_strip_pixels[i * 3 + 2] = blue;   // Blue
+
+            ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, g_led_config.led_numbers * 3, &tx_config));
+            ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));  // Wait for transmit to finish
+
+            vTaskDelay(pdMS_TO_TICKS(wait_ms));  // Adjust speed of running light
+        }
+    }
+}
+
+
+void breathing_effect(rmt_channel_handle_t led_chan, rmt_encoder_handle_t led_encoder, uint32_t hex_color) {
+    ESP_LOGI(TAG, "Starting breathing effect");
+
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,  // No hardware loop
+    };
+
+    uint8_t red = (hex_color >> 16) & 0xFF;  // Extract Red
+    uint8_t green = (hex_color >> 8) & 0xFF; // Extract Green
+    uint8_t blue = hex_color & 0xFF;         // Extract Blue
+
+    while (g_led_config.mode == 6) {
+        for (int brightness = 0; brightness <= 255; brightness++) {
+            // Fade in
+            for (int i = 0; i < g_led_config.led_numbers; i++) {
+                led_strip_pixels[i * 3 + 0] = green * brightness / 255;  // Green
+                led_strip_pixels[i * 3 + 1] = red * brightness / 255;    // Red
+                led_strip_pixels[i * 3 + 2] = blue * brightness / 255;   // Blue
+            }
+            ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, g_led_config.led_numbers * 3, &tx_config));
+            ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
+            vTaskDelay(pdMS_TO_TICKS(20));  // Adjust fade speed
+        }
+
+        for (int brightness = 255; brightness >= 0; brightness--) {
+            // Fade out
+            for (int i = 0; i < g_led_config.led_numbers; i++) {
+                led_strip_pixels[i * 3 + 0] = green * brightness / 255;  // Green
+                led_strip_pixels[i * 3 + 1] = red * brightness / 255;    // Red
+                led_strip_pixels[i * 3 + 2] = blue * brightness / 255;   // Blue
+            }
+            ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, g_led_config.led_numbers * 3, &tx_config));
+            ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
+            vTaskDelay(pdMS_TO_TICKS(20));  // Adjust fade speed
+        }
+    }
+}
+
+void random_flash_effect(rmt_channel_handle_t led_chan, rmt_encoder_handle_t led_encoder) {
+    ESP_LOGI(TAG, "Starting random flash effect");
+
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,  // No hardware loop
+    };
+
+    while (g_led_config.mode == 7) {
+        uint8_t red = rand() % 256;  // Random Red
+        uint8_t green = rand() % 256; // Random Green
+        uint8_t blue = rand() % 256;  // Random Blue
+
+        for (int i = 0; i < g_led_config.led_numbers; i++) {
+            led_strip_pixels[i * 3 + 0] = green;  // Green
+            led_strip_pixels[i * 3 + 1] = red;    // Red
+            led_strip_pixels[i * 3 + 2] = blue;   // Blue
+        }
+
+        ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, g_led_config.led_numbers * 3, &tx_config));
+        ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
+        vTaskDelay(pdMS_TO_TICKS(200));  // Adjust flash speed
+    }
+}
+
+
+void update_led_effects(void *pvParameters) {
+    led_task_params_t *params = (led_task_params_t *)pvParameters;
+
+    // Now you can access led_chan and led_encoder through params
+    rmt_channel_handle_t led_chan = params->led_chan;
+    rmt_encoder_handle_t led_encoder = params->led_encoder;
+
+    // Start updating the LED effects based on the dynamic parameters
+    while (true) {
+        // Update the LED effect, for example, a rainbow chase or other effects
+        
+        
+       switch (g_led_config.mode) {
+        case 1:
+            set_all_leds_color_from_hex(led_chan, led_encoder, g_led_config.colour);
+            break;
+        case 2:
+            rainbow_chase(led_chan, led_encoder);
+            break;
+        case 3:
+        	 color_wipe_chase(led_chan, led_encoder);
+        	 break;
+        case 4:
+        	 theater_chase_effect(led_chan, led_encoder,g_led_config.colour);
+        	 break;
+        case 5:
+        	 running_lights_effect(led_chan, led_encoder,g_led_config.colour);
+        	 break;
+        case 6:
+        	 breathing_effect(led_chan, led_encoder,g_led_config.colour);
+        	 break;
+        case 7:
+        	 random_flash_effect(led_chan, led_encoder);
+        	 break;
+        // Add more effects/modes here
+        default:
+            break;
+    }
+
+        // Add a delay according to the current chase speed
+        vTaskDelay(pdMS_TO_TICKS(g_led_config.chase_speed_ms)); // Delay for chase speed
+    }
+}
+
+
+
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Create RMT TX channel");
+     ESP_LOGI(TAG, "Start app");
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    
-    init_device_info();
-    
-    wifi_creds_t creds = { 0 };
-    if (read_wifi_creds_from_nvs(&creds)) {
-        ESP_LOGI(TAG, "Trying saved WiFi credentials...");
-        if (connect_to_wifi(&creds)) {
-            ESP_LOGI(TAG, "Connected to saved WiFi.");
-            // Do NOT return here — continue to LED init
-            xTaskCreate(udp_listener_task, "udp_listener", 4096, NULL, 5, NULL);
 
-        } else {
-            ESP_LOGW(TAG, "Failed to connect. Switching to AP mode...");
-            start_ap_mode();
-            xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 5, NULL);
-        }
-    } else {
-        ESP_LOGW(TAG, "No credentials found. Switching to AP mode...");
-        start_ap_mode();
-        xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 5, NULL);
-    }
+    // Default values in case NVS is empty
+   
 
-    // LED setup should happen no matter how Wi-Fi is configured
-    led_strip_pixels = (uint8_t *)malloc(EXAMPLE_LED_NUMBERS * 3 * sizeof(uint8_t));
-    if (led_strip_pixels == NULL) {
+    
+ESP_LOGI(TAG, "Loading LED config from NVS...");
+ esp_err_t config_status = load_led_config_from_nvs();
+if (config_status != ESP_OK || g_led_config.led_numbers == 0) {
+    ESP_LOGW(TAG, "LED config failed or led_numbers is zero, setting defaults");
+    g_led_config.led_numbers = 8;  // Hard fallback
+}
+
+
+
+    // Allocate LED buffer
+    led_strip_pixels = (uint8_t *)malloc(g_led_config.led_numbers * 3);
+    if (!led_strip_pixels) {
         ESP_LOGE(TAG, "Failed to allocate memory for LED pixels");
         return;
     }
@@ -686,10 +1028,47 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Enable RMT TX channel");
     ESP_ERROR_CHECK(rmt_enable(led_chan));
-xTaskCreate(tcp_receive_task, "tcp_receive", 4096, NULL, 5, NULL);
+
 
     ESP_LOGI(TAG, "Start LED effects");
-    rainbow_chase(led_chan, led_encoder);
-    
+   // rainbow_chase(led_chan, led_encoder);
+      led_task_params_t params = {
+        .led_chan = led_chan,
+        .led_encoder = led_encoder
+    };
+  xTaskCreate(update_led_effects, "update_led_effects", 4096, &params, 5, NULL);
+    while (g_led_config.led_numbers == 0) {
+		
+		printf("no led");
+
 }
+    
+    wifi_creds_t creds = { 0 };
+    if (read_wifi_creds_from_nvs(&creds)) {
+        ESP_LOGI(TAG, "Trying saved WiFi credentials...");
+        if (connect_to_wifi(&creds)) {
+            ESP_LOGI(TAG, "Connected to saved WiFi.");
+            // Do NOT return here — continue to LED init
+            xTaskCreate(udp_listener_task, "udp_listener", 4096, NULL, 5, NULL);
+
+        } else {
+            ESP_LOGW(TAG, "Failed to connect. Switching to AP mode...");
+            start_ap_mode();
+            xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 5, NULL);
+        }
+    } else {
+        ESP_LOGW(TAG, "No credentials found. Switching to AP mode...");
+        start_ap_mode();
+        xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 5, NULL);
+    }
+ init_device_info();
+ xTaskCreate(tcp_server_task1, "tcp_receive", 4096, NULL, 5, NULL);
+  printf("Updated buffer: LED Numbers: %lu, LED Brightness: %.2f, Speed: %d ms\n ", 
+               g_led_config.led_numbers, g_led_config.led_brightness, g_led_config.chase_speed_ms);
+        printf("direction: %u, mode: %u, colour: 0x%08lx\n",
+               g_led_config.chase_direction,
+               g_led_config.mode,
+               (unsigned long)g_led_config.colour);
+}
+
 
