@@ -27,7 +27,8 @@
 
 
 
-
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_STARTED_BIT   BIT1
 
 #define RMT_LED_STRIP_RESOLUTION_HZ 10000000 // 10MHz resolution, 1 tick = 0.1us (led strip needs a high resolution)
 #define RMT_LED_STRIP_GPIO_NUM      18
@@ -55,6 +56,7 @@ wifi_ap_record_t scanned_ap_list[MAX_AP_NUM];
 uint16_t scanned_ap_count = 0;
 SemaphoreHandle_t ap_list_mutex;  // Mutex to protect access
 SemaphoreHandle_t wifi_scan_mutex = NULL;
+void wifi_scan_task(void *pvParameters);
 
 
 // Move recv_buffer to static to reduce stack usage
@@ -265,29 +267,17 @@ void update_led_config_from_message(const char* message) {
 
         if (status == 1) {
             // Clean up existing tasks before switching to AP mode
-            static TaskHandle_t tcp_server_task_handle = NULL;
-            static TaskHandle_t tcp_server_task1_handle = NULL;
-            static TaskHandle_t udp_listener_task_handle = NULL;
-
-            if (tcp_server_task_handle != NULL) {
-                vTaskDelete(tcp_server_task_handle);
-                tcp_server_task_handle = NULL;
-            }
-            if (tcp_server_task1_handle != NULL) {
-                vTaskDelete(tcp_server_task1_handle);
-                tcp_server_task1_handle = NULL;
-            }
-            if (udp_listener_task_handle != NULL) {
-                vTaskDelete(udp_listener_task_handle);
-                udp_listener_task_handle = NULL;
-            }
+            
 
             // Stop WiFi and disconnect STA
-            esp_wifi_disconnect();
-            esp_wifi_stop();
-            vTaskDelay(pdMS_TO_TICKS(1000)); // Increased delay for clean state
+           
 
-            start_ap_mode();
+            //start_ap_mode();
+            if (wifi_scan_task_handle == NULL) {
+
+    xTaskCreate(wifi_scan_task, "wifi_scan_task", 4096, NULL, 5, &wifi_scan_task_handle);
+    ESP_LOGI(TAG, "Wi-Fi scan task created");
+}
         }
     } else {
         ESP_LOGE(TAG, "Failed to parse message properly, parsed %d items", parsed_items1);
@@ -300,6 +290,9 @@ void tcp_server_task1(void *pvParameters) {
     ESP_LOGW(TAG, "tcp_server_task1 is already running!");
     vTaskDelete(NULL); // kill duplicate task
 }
+
+tcp_server_task1_handle = xTaskGetCurrentTaskHandle(); // 👈 add this line at start of task
+
     struct sockaddr_in server_addr, client_addr;
     int sockfd, new_sock;
     socklen_t addr_len = sizeof(client_addr);
@@ -334,7 +327,8 @@ void tcp_server_task1(void *pvParameters) {
 
         // Set socket options to reuse address
         int opt = 1;
-        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
         // Set up server address
         memset(&server_addr, 0, sizeof(server_addr));
@@ -651,7 +645,9 @@ static bool read_wifi_creds_from_nvs(wifi_creds_t *creds) {
 // Event Handler for STA mode
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        ESP_LOGI(TAG, "WIFI_EVENT_STA_START received");
+        xEventGroupSetBits(wifi_event_group, WIFI_STARTED_BIT);  // ✅ Set this!
+        // esp_wifi_connect();  <-- You can optionally remove this, since reconnect_sta_mode calls it manually
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "Disconnected. Reconnecting...");
         esp_wifi_connect();
@@ -661,6 +657,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
+
 
 // STA Mode Connect
 static bool connect_to_wifi() {
@@ -685,12 +682,16 @@ static bool connect_to_wifi() {
 int reconnect_sta_mode(const wifi_creds_t *creds) {
     if (!xSemaphoreTake(wifi_scan_mutex, pdMS_TO_TICKS(3000))) {
         ESP_LOGW(TAG, "Could not acquire wifi_scan_mutex, skipping STA connection");
-        start_ap_mode();
+        if (wifi_scan_task_handle == NULL) {
+            xTaskCreate(wifi_scan_task, "wifi_scan_task", 4096, NULL, 5, &wifi_scan_task_handle);
+            ESP_LOGI(TAG, "Wi-Fi scan task created");
+        }
         return 0;
     }
 
     ESP_LOGI(TAG, "Stopping AP mode...");
 
+    // Disconnect if connected
     wifi_ap_record_t ap_info;
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
         ESP_LOGI(TAG, "STA connected, disconnecting...");
@@ -703,7 +704,7 @@ int reconnect_sta_mode(const wifi_creds_t *creds) {
     esp_wifi_stop();
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    // Clean up and re-register event handlers
+    // Clean up old event group
     if (wifi_event_group) {
         esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler);
         esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler);
@@ -711,6 +712,7 @@ int reconnect_sta_mode(const wifi_creds_t *creds) {
         wifi_event_group = NULL;
     }
 
+    // Create new event group and re-register handlers
     wifi_event_group = xEventGroupCreate();
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL);
@@ -728,26 +730,44 @@ int reconnect_sta_mode(const wifi_creds_t *creds) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    int connected = connect_to_wifi(creds);
-    if (connected) {
-        ESP_LOGI(TAG, "Connected to WiFi successfully.");
-        if (mdns_flag ) {
-			init_device_info();
-			mdns_flag =0;
-		}
-        
-    } else {
-        ESP_LOGE(TAG, "Failed to connect with new credentials.");
-        ESP_LOGI(TAG, "Stopping WiFi to reset state...");
+    // Wait for STA_START before calling esp_wifi_connect()
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_STARTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(5000));
+    if (!(bits & WIFI_STARTED_BIT)) {
+        ESP_LOGE(TAG, "STA_START not received, WiFi driver not ready.");
         esp_wifi_stop();
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        start_ap_mode();
+        xSemaphoreGive(wifi_scan_mutex);
+        return 0;
     }
 
-    xSemaphoreGive(wifi_scan_mutex);
-    return connected;
+    ESP_LOGI(TAG, "Calling esp_wifi_connect...");
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_connect() failed: %s", esp_err_to_name(err));
+        esp_wifi_stop();
+        xSemaphoreGive(wifi_scan_mutex);
+        return 0;
+    }
+
+    ESP_LOGI(TAG, "Waiting for connection success...");
+    bits = xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(10000));
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "Connected to WiFi successfully.");
+        if (mdns_flag) {
+            init_device_info();
+            mdns_flag = 0;
+        }
+        xSemaphoreGive(wifi_scan_mutex);
+        return 1;
+    } else {
+        ESP_LOGE(TAG, "Failed to connect with new credentials.");
+        esp_wifi_stop();
+        if (wifi_scan_task_handle == NULL) {
+            xTaskCreate(wifi_scan_task, "wifi_scan_task", 4096, NULL, 5, &wifi_scan_task_handle);
+            ESP_LOGI(TAG, "Wi-Fi scan task created");
+        }
+        xSemaphoreGive(wifi_scan_mutex);
+        return 0;
+    }
 }
 
 
@@ -1015,12 +1035,12 @@ release_mutex:
     // ---- Restart TCP Tasks ---- //
    
 
-    if (send_ap_list_task_handle == NULL ) {
+    if (send_ap_list_task_handle == NULL && status == 1 ) {
         xTaskCreate(send_ap_list_task, "send_ap_list_task", 4096, NULL, 5, &send_ap_list_task_handle);
         ESP_LOGI(TAG, "Created send_ap_list_task");
     }
 
-    if (tcp_server_task_handle == NULL) {
+    if (tcp_server_task_handle == NULL && status ==1) {
         xTaskCreate(tcp_server_task, "tcp_server_task", 4096, NULL, 5, &tcp_server_task_handle);
         ESP_LOGI(TAG, "Created tcp_server_task");
     }
@@ -1029,6 +1049,7 @@ release_mutex:
     
 
 cleanup:
+	status = 0;
     wifi_scan_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -1045,17 +1066,7 @@ static void start_ap_mode() {
     esp_wifi_stop();
     vTaskDelay(pdMS_TO_TICKS(1000)); // Delay to ensure clean state
 
-    // Configure default LED
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << LED_GPIO_NUM),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    ESP_ERROR_CHECK(gpio_config(&io_conf));
-    ESP_ERROR_CHECK(gpio_set_level(LED_GPIO_NUM, 1));
-    ESP_LOGI(TAG, "Default LED turned on in AP mode");
+   
 
     // Check if AP interface exists
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
@@ -1143,6 +1154,19 @@ static void tcp_server_task(void *pvParameter) {
         close(sock);
         close(listen_sock);
     }
+    
+     // If the task is already running, delete it first
+if (tcp_server_task1_handle != NULL) {
+    ESP_LOGI(TAG, "Deleting existing tcp_server_task1...");
+    vTaskDelete(tcp_server_task1_handle);
+    tcp_server_task1_handle = NULL;
+    vTaskDelay(pdMS_TO_TICKS(100)); // Give scheduler time to clean up
+}
+
+// Now create it again
+ESP_LOGI(TAG, "Creating new tcp_server_task1...");
+xTaskCreate(tcp_server_task1, "tcp_receive", 4096, NULL, 5, &tcp_server_task1_handle);
+
 	ESP_LOGI(TAG, "Deleting send_ap_list_task_...");
         vTaskDelete(send_ap_list_task_handle);
         send_ap_list_task_handle = NULL;
@@ -1801,7 +1825,17 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to allocate memory for LED pixels");
         return;
     }
-
+ // Configure default LED
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << LED_GPIO_NUM),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    ESP_ERROR_CHECK(gpio_set_level(LED_GPIO_NUM, 1));
+    ESP_LOGI(TAG, "Default LED turned on in AP mode");
     rmt_channel_handle_t led_chan = NULL;
     rmt_tx_channel_config_t tx_chan_config = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
